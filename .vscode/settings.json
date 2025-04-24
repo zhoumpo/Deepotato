@@ -5,6 +5,5 @@
         "editor.codeActionsOnSave": {
             "source.organizeImports": "always"
         }
-    },
-    "files.autoSave": "afterDelay",
+    }
 }
