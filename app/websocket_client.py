@@ -110,8 +110,6 @@ class WebSocketClient:
 
     def _log(self, message: str):
         """Log a message to the console callback if available."""
-        if self.console_callback:
-            self.console_callback(f"Client: {message}\n")
         self.logger.info(message)
 
 
