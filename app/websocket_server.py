@@ -3,12 +3,15 @@ WebSocket server implementation using the websockets library.
 """
 
 import asyncio
+import json
 import logging
 import threading
 import time
-from typing import Callable, Optional, Set
+from typing import Callable, Optional, Set, Dict, Any
 
 import websockets
+
+from .game_agent import GameAgent
 
 
 class WebSocketServer:
@@ -29,12 +32,30 @@ class WebSocketServer:
         self.running = False
         self.connected_clients: Set[websockets.WebSocketServerProtocol] = set()
         self._shutdown_event = threading.Event()
+        
+        # Initialize game agent
+        self.game_agent = GameAgent()
+        self.agent_enabled = True  # Toggle for enabling/disabling the agent
+        self.last_game_data = None
+        self.last_command_time = time.time()
+        self.command_interval = 0.2  # Increased to 200ms for better performance
+        self.step_count = 0  # Counter for logging
 
         # Set up logging to use our console callback
         self.logger = logging.getLogger(__name__)
         if console_callback:
             self.logger.addHandler(ConsoleCallbackHandler(console_callback))
             self.logger.setLevel(logging.INFO)
+            
+    def toggle_agent(self, enabled: bool) -> None:
+        """Enable or disable the agent."""
+        self.agent_enabled = enabled
+        self._log(f"Agent {'enabled' if enabled else 'disabled'}")
+        
+        # Reset agent state when toggling on
+        if enabled:
+            self.game_agent.reset()
+            self._log("Agent state reset")
 
     def start(self) -> bool:
         """Start the WebSocket server in a separate thread.
@@ -56,12 +77,20 @@ class WebSocketServer:
             self.server_thread.daemon = True  # Thread will exit when main program exits
             self.server_thread.start()
 
-            # Wait briefly to ensure the server starts successfully
+            # Wait to see if server starts successfully
             start_time = time.time()
-            while not self.running and time.time() - start_time < 2.0:
-                time.sleep(0.1)  # Check every 100ms for up to 2 seconds
+            while time.time() - start_time < 3.0:  # Wait up to 3 seconds
+                time.sleep(0.1)
+                if self.running:
+                    return True
+                # Check if thread has ended prematurely
+                if not self.server_thread.is_alive():
+                    self._log("Server thread exited prematurely")
+                    return False
 
-            return self.running
+            self._log("Timed out waiting for server to start")
+            return False
+            
         except Exception as e:
             self._log(f"Error starting server thread: {str(e)}")
             return False
@@ -97,11 +126,15 @@ class WebSocketServer:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self.event_loop = loop
+            
+            self._log("Server thread started with new event loop")
 
             # Run the server in the event loop
             loop.run_until_complete(self._run_server())
         except Exception as e:
+            import traceback
             self._log(f"Server thread error: {str(e)}")
+            self._log(f"Traceback: {traceback.format_exc()}")
         finally:
             self._log("Server thread exiting")
             self.running = False
@@ -114,18 +147,66 @@ class WebSocketServer:
 
             # It's important to bind to 0.0.0.0 to allow external connections
             # Change to 'localhost' if you only want local connections
-            self.server = await websockets.serve(
-                self._handle_client_connection,
-                "0.0.0.0",  # Changed from localhost to allow connections from any IP
-                self.port,
-            )
-
-            self.running = True
-            self._log(f"WebSocket server running on port {self.port}")
+            try:
+                self.server = await websockets.serve(
+                    self._handle_client_connection,
+                    "0.0.0.0",  # Bind to all interfaces to allow connections from the game
+                    self.port,
+                )
+                
+                self.running = True
+                self._log(f"WebSocket server running on port {self.port}")
+            except OSError as e:
+                self._log(f"Failed to start server: {str(e)}. The port may already be in use.")
+                return
+            except Exception as e:
+                self._log(f"Error in server: {str(e)}")
+                return
 
             # Keep the server running until we get a shutdown signal
             while not self._shutdown_event.is_set():
-                await asyncio.sleep(0.1)
+                # Check if we should send a command to the game
+                if (self.agent_enabled and 
+                    self.last_game_data and 
+                    time.time() - self.last_command_time >= self.command_interval and
+                    len(self.connected_clients) > 0):
+                    
+                    try:
+                        # Using a larger interval to reduce CPU usage
+                        self.last_command_time = time.time()
+                        
+                        # Process game data and get movement command
+                        # This could be heavy, so we'll log timing
+                        start_time = time.time()
+                        direction = self.game_agent.process_game_data(self.last_game_data)
+                        processing_time = time.time() - start_time
+                        
+                        if processing_time > 0.1:  # Log if processing takes more than 100ms
+                            self._log(f"Warning: Game data processing took {processing_time:.3f} seconds")
+                        
+                        # Create command message
+                        command = {
+                            "command": "move",
+                            "direction": direction
+                        }
+                        command_json = json.dumps(command)
+                        
+                        # Send command to all connected clients
+                        for client in self.connected_clients:
+                            await client.send(command_json)
+                        
+                        # Log only occasionally to reduce spam
+                        if self.step_count % 10 == 0:
+                            self._log(f"Sent command: {command_json}")
+                            
+                        self.step_count = self.step_count + 1 if hasattr(self, 'step_count') else 1
+                    except Exception as e:
+                        import traceback
+                        self._log(f"Error sending command: {str(e)}")
+                        self._log(f"Traceback: {traceback.format_exc()}")
+                
+                # Reduced check frequency to improve performance
+                await asyncio.sleep(0.1)  # Check every 100ms
 
             # Clean shutdown
             self._log("Server shutdown initiated")
@@ -180,10 +261,14 @@ class WebSocketServer:
         try:
             # Handle messages from the client
             async for message in websocket:
-                self._log(f"Received message from client {client_id}: {message}")
-
-                # Echo the message back to the client
-                await websocket.send(f"Echo: {message}")
+                self._log(f"Received message from client {client_id}: {message[:100]}...")  # Log only the first 100 chars for brevity
+                
+                # Store the game data for the agent to process
+                self.last_game_data = message
+                
+                # If we want to send an immediate response, we can do so here
+                # For now, just ack the message
+                await websocket.send(json.dumps({"status": "received"}))
 
         except websockets.exceptions.ConnectionClosed as e:
             self._log(f"Client {client_id} disconnected: {e}")

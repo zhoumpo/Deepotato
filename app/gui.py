@@ -6,8 +6,8 @@ import re
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-from app.websocket_client import WebSocketClient
-from app.websocket_server import WebSocketServer
+from .websocket_client import WebSocketClient
+from .websocket_server import WebSocketServer
 
 
 class ConsoleOutput(scrolledtext.ScrolledText):
